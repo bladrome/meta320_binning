@@ -1,0 +1,444 @@
+#+title: The microbiome of meta320
+#+options: ^:nil
+
+* Prerequisites
+We strongly recommend to manage software environments using [[https://github.com/conda-forge/miniforge][mamba]], and also
+provide our environment yaml file.
+
+Create env via:
+#+begin_src bash
+env=r
+conda_dist=mambaforge
+mamba env create -f envs/${env}.yaml -p ${HOME}/${conda_dist}/envs/${env}
+
+# Activate it
+mamba activate $env
+# Deactivate it
+mamba deactivate
+#+end_src
+
+** envs
+- [[https://github.com/bxlab/metaWRAP][metaWRAP]]
+- [[https://drep.readthedocs.io/en/latest/][drep]]
+- [[https://ecogenomics.github.io/GTDBTk/index.html][GTDBTk]]
+- [[http://etetoolkit.org/][ete3]]
+- [[https://github.com/eggnogdb/eggnog-mapper][eggnog-mapper]]
+- [[https://github.com/linnabrown/run_dbcan][run_dbcan]]
+- [[https://github.com/WatsonLab/PULpy][PULpy]]
+- [[https://www.tidyverse.org/][r]]
+- [[https://pandas.pydata.org/][py]]
+
+** softwares
+- [[https://github.com/biobakery/kneaddata][kneaddata]]
+- [[https://www.bioinformatics.babraham.ac.uk/projects/download.html#fastqc][FastQC]]
+- [[https://bioinf.shenwei.me/seqkit/][seqkit]]
+- [[https://github.com/weizhongli/cdhit][cd-hit]]
+
+** Databases
+
+| database | version                | url                                                                    |
+|----------+------------------------+------------------------------------------------------------------------|
+| EggNOG   | emapperdb-5.0.2        | http://eggnog6.embl.de/download/emapperdb-5.0.2/                       |
+| GTDB-Tk  | release207             | https://data.ace.uq.edu.au/public/gtdb/data/releases/release207/207.0/ |
+| CheckM   | checkm_data_2015_01_16 | https://data.ace.uq.edu.au/public/CheckM_databases/                    |
+| dBCAN    | HMMdb-V11              | https://bcb.unl.edu/dbCAN2/download/                                   |
+
+
+
+
+* pipeline
+** 01_preprocessing
+*** prepare clean data
+
+#+begin_src bash :tangle pipeline/01_preprocessing.sh
+
+# PREPARE CLEAN DATA
+
+cd 1.rawdata/${sampleid}
+parallel gunzip {} ::: *gz
+cd -
+
+kneaddata \
+    --input1 rawdata/${sampleid}_1.fq \
+    --input1 rawdata/${sampleid}_1.fq \
+    -db ${REF_DATABASE} \
+    --trimmomatic-options 'ILLUMINACLIP:adapters_path:2:30:10 SLIDINGWINDOW:4:20 MINLEN:50' \
+    --bowtie2-options '--very-sensitive' \
+    --output trimcleandata/${sampleid}
+
+cp trimcleandata/${sampleid}/${sampleid}{1..2}.fastq \
+    cleandata/${sampleid}/
+
+mv cleandata/${sampleid}1.fastq cleandata/${sampleid}_1.fastq
+mv cleandata/${sampleid}2.fastq cleandata/${sampleid}_2.fastq
+
+#+end_src
+
+** 02_assembly-binning
+*** assembly
+#+begin_src bash :tangle pipeline/02_assembly-binning.sh
+
+# SAMPLE ASSEMBLY
+
+metawrap assembly -t $cpu -m $mem \
+    -1 ../cleandata/$sampleid/${sampleid}_1.fastq \
+    -2 ../cleandata/$sampleid/${sampleid}_2.fastq \
+    -o ../assembly/${sampleid} \
+    -l 500
+
+
+#+end_src
+*** binning
+#+begin_src bash :tangle pipeline/02_assembly-binning.sh
+
+# BINNING
+
+
+sampleassembly=`echo ${sampleid%%_*} | awk -F '-' '{print $1 $2}'`
+metawrap binning -t $cpu -m $mem \
+    -a ../assembly/Goat_110sample/${sampleassembly}.final.contigs.fa \
+    -o ../binning/${sampleid} \
+    -l 500 \
+    --universal \
+    --metabat2 \
+    --maxbin2 \
+    --interleaved \
+    ../cleandata/$sampleid/${sampleid}_1.fastq \
+    ../cleandata/$sampleid/${sampleid}_2.fastq
+
+
+#+end_src
+*** bin_refinement
+#+begin_src bash :tangle pipeline/02_assembly-binning.sh
+
+# BIN_REFINEMENT
+
+mkdir ../bin_refinement/${sampleid}
+metawrap bin_refinement -t $cpu -m $mem \
+    -o ../bin_refinement/${sampleid} \
+    -A ../binning/${sampleid}/metabat2_bins/ \
+    -B ../binning/${sampleid}/maxbin2_bins/ \
+    -c 50 -x 10 \
+    --quick
+
+#+end_src
+*** bin_reassembly
+#+begin_src bash :tangle pipeline/02_assembly-binning.sh
+
+# BIN_REASSEMBLY
+
+mkdir ../bin_reassembly/${sampleid}
+metawrap reassemble_bins -t $cpu -m $mem \
+    -o ../bin_reassembly/${sampleid} \
+    -1 ../cleandata/$sampleid/${sampleid}_1.fastq \
+    -2 ../cleandata/$sampleid/${sampleid}_2.fastq \
+    -c 50 \
+    -x 10 \
+    -b ../bin_refinement/${sampleid}/metawrap_50_10_bins
+
+
+#+end_src
+
+*** collect bins
+#+begin_src bash :tangle pipeline/02_assembly-binning.sh
+
+# collect all bins
+
+mkdir ../MAGs/
+
+if [ -d ../bin_reassembly/${sampleid}/reassembled_bins/reassembled_best_bins  ]
+then
+    binsdir=../bin_reassembly/${sampleid}/reassembled_bins/reassembled_best_bins
+else
+    binsdir=../bin_reassembly/${sampleid}/reassembled_bins/
+fi
+for bin in $binsdir/*.fa
+do
+    # echo ${sampleid} ${bin##*/}
+    cp $bin ../MAGs/${sampleid}_${bin##*/}
+done
+
+
+#+end_src
+*** drep
+#+begin_src bash :tangle pipeline/02_assembly-binning.sh
+
+# MAG de-replicate
+
+mkdir ../dRep/dRep99
+
+dRep dereplicate ../dRep/dRep99 \
+    -g ../MAGs/*.fa \
+    -p 30 \
+    -d -comp 50 \
+    -con 5 \
+    -nc 0.25 \
+    -pa 0.9 \
+    -sa 0.99
+
+#+end_src
+** 03_MAGs-taxonomy
+*** gtdbtk
+*** run
+#+begin_src bash :tangle pipeline/03_MAGs-taxonomy.sh
+
+# Taxonomic classification and phylogenetic analysis
+
+mkdir ../Taxonomy/gtdbtk
+
+gtdbtk classify_wf \
+    --cpus 90 \
+    --out_dir ../Taxonomy/gtdbtk \
+    --genome_dir ../dRep/dRep99/dereplicated_genomes \
+    --extension fa
+
+#+end_src
+*** convert_to_itol
+export itol tree from gtdb output
+#+begin_src bash :tangle pipeline/03_MAGs-taxonomy.sh
+
+ls ../Taxonomy/gtdbtk/*.tree | parallel echo \
+    'gtdbtk convert_to_itol \
+    --input_tree {} \
+    --output_tree {.}_itol.tree '
+
+#+end_src
+
+*** extract subtree
+#+begin_src python :tangle pipeline/03_extract_gtdb_subtree.py
+
+import pandas as pd
+from ete3 import PhyloTree
+
+t = PhyloTree("gtdbtk.bac120.classify.tree", format=1, quoted_node_names=True)
+
+uniq92df = pd.read_csv("uniq_92_Genome_name.csv")
+uniq92df = uniq92df[['user_genome', 'Genome name']]
+uniq92mags = uniq92df['user_genome']
+
+genomeName = {}
+for i, user_genome, genomename in uniq92df.itertuples():
+    genomeName[user_genome] = genomename
+
+t.prune(uniq92mags, preserve_branch_length=True)
+
+for i, node in enumerate(t):
+    node.name = genomeName[node.name]
+
+t.write(outfile="uniq92mags.tree")
+
+#+end_src
+
+** 04_MAGs-function
+*** quant
+#+begin_src bash :tangle pipeline/04_MAGs-function.sh
+
+# MAG abundance
+
+metawrap quant_bins \
+    -t 90 \
+    -b ../dRep/dRep99/dereplicated_genomes \
+    -o ../MAGs_quant_noassemble \
+    ../cleandata/*/*.fastq
+    # -a assembly/all_contigs.fa
+
+#+end_src
+
+*** eggnog
+
+we use *seqkit* to slice the combined.fa
+#+begin_src bash :tangle pipeline/04_slice_combined_fa.py
+
+import numpy as np
+import os
+
+len_combined_fa = 10000
+n_slice = 20
+
+index = np.linspace(1, len_combined_fa + 1, n_slice, dtype=int)
+start = index[:-1]
+end = index[1:] - 1
+
+for i, (a, b) in enumerate(zip(start, end)):
+    cmd = f"seqkit range -r {a}:{b} meta320_all_mags.fa > {i+1}.fa"
+    print(cmd)
+    # os.system(cmd)
+#+end_src
+
+#+begin_src bash :tangle pipeline/04_MAGs-function.sh
+
+emapper.py  \
+    -i ../combined_${slice}.fa \
+    --itype genome \
+    -m mmseqs \
+    --cpu 250 \
+    --data_dir /your/path/to/eggnog/databank \
+    --dbmem \
+    --output_dir output_${slice} \
+    -o ${slice}.log > output_${slice}/${slice}.log 2 >& 1
+
+#+end_src
+
+*** [[https://github.com/linnabrown/run_dbcan][run_dbcan]]
+
+**** dbCAN database install
+#+begin_src bash :tangle pipeline/04_install_dbcan_database.sh
+
+test -d db || mkdir db
+cd db \
+    && wget http://bcb.unl.edu/dbCAN2/download/Databases/fam-substrate-mapping-08252022.tsv \
+    && wget http://bcb.unl.edu/dbCAN2/download/Databases/dbCAN-PUL_07-01-2022.xlsx && wget http://bcb.unl.edu/dbCAN2/download/Databases/dbCAN-PUL_07-01-2022.txt \
+    && wget http://bcb.unl.edu/dbCAN2/download/Databases/dbCAN-PUL.tar.gz && tar xvf dbCAN-PUL.tar.gz \
+    && wget http://bcb.unl.edu/dbCAN2/download/Databases/dbCAN_sub.hmm && hmmpress dbCAN_sub.hmm \
+    && wget http://bcb.unl.edu/dbCAN2/download/Databases/V11/CAZyDB.08062022.fa && diamond makedb --in CAZyDB.08062022.fa -d CAZy \
+    && wget https://bcb.unl.edu/dbCAN2/download/Databases/V11/dbCAN-HMMdb-V11.txt && mv dbCAN-HMMdb-V11.txt dbCAN.txt && hmmpress dbCAN.txt \
+    && wget https://bcb.unl.edu/dbCAN2/download/Databases/V11/tcdb.fa && diamond makedb --in tcdb.fa -d tcdb \
+    && wget http://bcb.unl.edu/dbCAN2/download/Databases/V11/tf-1.hmm && hmmpress tf-1.hmm \
+    && wget http://bcb.unl.edu/dbCAN2/download/Databases/V11/tf-2.hmm && hmmpress tf-2.hmm \
+    && wget https://bcb.unl.edu/dbCAN2/download/Databases/V11/stp.hmm && hmmpress stp.hmm \
+    && wget https://bcb.unl.edu/dbCAN2/download/Databases/PUL.faa \
+    && cd ../ && wget http://bcb.unl.edu/dbCAN2/download/Samples/EscheriaColiK12MG1655.fna \
+    && wget http://bcb.unl.edu/dbCAN2/download/Samples/EscheriaColiK12MG1655.faa \
+    && wget http://bcb.unl.edu/dbCAN2/download/Samples/EscheriaColiK12MG1655.gff
+
+#+end_src
+
+**** run
+#+begin_src bash :tangle pipeline/04_MAGs-function.sh
+
+run_dbcan \
+    ${sample_mag}.fa meta \
+    --dia_cpu 64 \
+    --hmm_cpu 64 \
+    --out_dir ${sample_mag}_ourdir
+    --db_dir db \
+    --tools all \
+    --use_signalP 1 \
+    --dbcan_thread 64 \
+    --tf_cpu 64 \
+    --stp_cpu 64 \
+    --pul db/PUL.faa \
+    --out ${sample_mag}_ourdir/pulresults.txt
+
+#+end_src
+*** [[https://github.com/WatsonLab/PULpy][PULpy]]
+*** install
+#+begin_src bash
+git clone https://github.com/WatsonLab/PULpy.git
+chmod -R 755 PULpy/scripts
+mamba env create -f envs/PULpy.yaml
+mamba activate PULpy
+#+end_src
+*** download data
+#+begin_src bash
+## Pfam
+mkdir pfam_data && cd pfam_data
+wget ftp://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.gz
+wget ftp://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.dat.gz
+wget ftp://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/active_site.dat.gz
+gunzip Pfam-A.hmm.gz Pfam-A.hmm.dat.gz active_site.dat.gz
+hmmpress Pfam-A.hmm
+cd ..
+
+## DBCAN
+mkdir dbcan_data && cd dbcan_data
+wget https://bcb.unl.edu/dbCAN2/download/Databases/dbCAN-old@UGA/hmmscan-parser.sh &
+wget https://bcb.unl.edu/dbCAN2/download/Databases/dbCAN-old@UGA/dbCAN-fam-HMMs.txt.v10
+hmmpress dbCAN-fam-HMMs.txt
+chmod 755 hmmscan-parser.sh
+#+end_src
+*** run
+change config file
+#+begin_src bash
+# IDS, = glob_wildcards("genomes/{id}_genomic.fna.gz")
+IDS, = glob_wildcards("/path/to/your/mags_dir/{id}.fa")
+#+end_src
+
+snakemake run
+#+begin_src bash
+snakemake --use-conda
+#+end_src
+*** extract result
+#+begin_src python :tangle pipeline/04_extract_cazy_result.py
+import pandas as pd
+import os
+import re
+
+
+magsfile = "/path/to/all/MAGS_TABLE.tsv"
+allcazydir = "/path/to/all/cazy_pul/results"
+outdir = "/CAZY_TABLE/"
+
+# pivot = "DIAMOND"
+# pivot = "dbCAN_sub"
+pivot = "HMMER"
+
+allcazydf = []
+for sample in os.listdir(allcazydir):
+    if not sample.startswith("outdir"):
+        continue
+    cazyoverview = os.path.join(allcazydir, sample, "overview.txt")
+    if not os.path.exists(cazyoverview):
+        print(cazyoverview, "not exists")
+        continue
+    df = pd.read_csv(cazyoverview, sep="\t")
+
+    stats = []
+    for i in df[pivot]:
+        if i.startswith("-"):
+            continue
+        i=re.sub('\(.*?\)','',i)
+        stats.extend(i.split("+"))
+    df = pd.DataFrame({pivot:stats}).value_counts().reset_index()
+    df['Bin id'] = sample.lstrip("outdir_")
+    allcazydf.append(df)
+
+print("allcazydf len: ", len(allcazydf))
+allcazydf = pd.concat(allcazydf)
+allcazydf.rename(columns={0: "values"}, inplace=True)
+
+allcazydf = allcazydf.pivot_table(index="Bin id", columns=pivot, values="values").reset_index()
+allcazydf = allcazydf.fillna(0).convert_dtypes()
+
+allpuldf = []
+pulsdir = "/path/to/puls/result"
+for pulsample in os.listdir(pulsdir):
+    if not 'sum' in pulsample:
+        continue
+    if os.path.getsize(os.path.join(pulsdir, pulsample)) == 0:
+        continue
+    df = pd.read_csv(os.path.join(pulsdir, pulsample), sep="\t")
+    df = df[['pulid', 'pattern']]
+    df['Bin id'] = pulsample.rstrip(".pulls.sum.tsv")
+    allpuldf.append(df)
+
+pulcountdf = pd.DataFrame([(df['Bin id'][0], df.shape[0]) for df in allpuldf],
+                          columns=("Bin id", "pulcount"))
+allpuldf = pd.concat(allpuldf)
+allpuldf = allpuldf.pivot(index="Bin id", columns="pulid", values="pattern").reset_index()
+pulcolumns = ['Bin id'] + [f"PUL{i}" for i in range(1, allpuldf.shape[1]) ]
+allpuldf = allpuldf[pulcolumns]
+allpuldf.to_csv(os.path.join(outdir, f"CAZY_PUL_TABLE.csv"), index=False)
+
+
+allcazydf = pd.merge(allcazydf, pulcountdf, how='left')
+allcazydf['pulcount'] = allcazydf['pulcount'].fillna(0).convert_dtypes()
+
+
+magsdf = pd.read_csv(magsfile, sep="\t")
+taxdf = magsdf['classification'].str.split(";", expand=True)
+taxdf.rename(columns={0: "Domain",
+                      1: "Phylum",
+                      2: "Class",
+                      3: "Order",
+                      4: "Family",
+                      5: "Genus",
+                      6: "Species"  }, inplace=True)
+magsdf = magsdf[["user_genome", "Genome name", "Bin id"]]
+magsdf = pd.concat([magsdf, taxdf], axis=1)
+outdf = pd.merge(magsdf, allcazydf, how='left')
+outdf.fillna(0, inplace=True)
+
+outdf.to_csv(os.path.join(outdir, f"CAZY_{pivot}.csv"), index=False)
+#+end_src
+
